@@ -675,8 +675,8 @@ jobs:
           sudo rm -rf /usr/local/lib/android &
           sudo rm -rf /opt/ghc &
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig $KSU_MAKE_ARGS &&
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image $KSU_MAKE_ARGS
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig $KSU_MAKE_ARGS 2>&1 | tee "$WORKDIR/kernel_workspace/build-configure.log" &&
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image $KSU_MAKE_ARGS 2>&1 | tee "$WORKDIR/kernel_workspace/build-compile.log"
           
           # 编译后时间劫持二次校验
           echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
@@ -687,6 +687,39 @@ jobs:
           ccache -s
           echo "编译后空间:"
           df -h
+
+      - name: 收集编译错误摘要
+        if: failure()
+        run: |
+          LOGDIR="${{ github.workspace }}/kernel_workspace"
+          {
+            echo "### 🔧 编译失败摘要（用于定位报错）"
+            echo ""
+            for f in build-configure.log build-compile.log; do
+              if [ ! -f "$LOGDIR/$f" ]; then
+                echo "- 未生成 \`$f\`（可能在该阶段之前就失败了）"
+                continue
+              fi
+              echo "#### $f"
+              echo '```text'
+              OUT="$(grep -nE "error:|fatal error|undefined reference|No rule to make|Error [0-9]+|make(\[[0-9]+\])?: \*\*\*" "$LOGDIR/$f" | tail -n 40)"
+              if [ -z "$OUT" ]; then
+                OUT="$(tail -n 40 "$LOGDIR/$f")"
+              fi
+              printf '%s\n' "$OUT"
+              echo '```'
+              echo ""
+            done
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 上传编译日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: |
+            ${{ github.workspace }}/kernel_workspace/build-*.log
+          if-no-files-found: warn
 
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
