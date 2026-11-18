@@ -603,6 +603,8 @@ jobs:
            
       - name: 构建内核
         run: |
+          # 显式打开 pipefail：make 的输出走 tee 时，失败必须让本步骤失败（否则会“假成功”，编不出 Image）
+          set -eo pipefail
           WORKDIR="$(pwd)"
           # FinaSU 等分支需要在 make 时传入额外参数，由前面的步骤写入 KSU_MAKE_ARGS
           KSU_MAKE_ARGS="${KSU_MAKE_ARGS:-}"
@@ -688,39 +690,6 @@ jobs:
           echo "编译后空间:"
           df -h
 
-      - name: 收集编译错误摘要
-        if: failure()
-        run: |
-          LOGDIR="${{ github.workspace }}/kernel_workspace"
-          {
-            echo "### 🔧 编译失败摘要（用于定位报错）"
-            echo ""
-            for f in build-configure.log build-compile.log; do
-              if [ ! -f "$LOGDIR/$f" ]; then
-                echo "- 未生成 \`$f\`（可能在该阶段之前就失败了）"
-                continue
-              fi
-              echo "#### $f"
-              echo '```text'
-              OUT="$(grep -nE "error:|fatal error|undefined reference|No rule to make|Error [0-9]+|make(\[[0-9]+\])?: \*\*\*" "$LOGDIR/$f" | tail -n 40)"
-              if [ -z "$OUT" ]; then
-                OUT="$(tail -n 40 "$LOGDIR/$f")"
-              fi
-              printf '%s\n' "$OUT"
-              echo '```'
-              echo ""
-            done
-          } >> $GITHUB_STEP_SUMMARY
-
-      - name: 上传编译日志
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: build-logs
-          path: |
-            ${{ github.workspace }}/kernel_workspace/build-*.log
-          if-no-files-found: warn
-
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
@@ -743,15 +712,35 @@ jobs:
       - name: 克隆 AnyKernel3 并打包
         id: create_zip
         run: |
+          # 本步骤的输出同时写入 packaging.log，失败时由“汇总失败原因”步骤提取
+          exec > >(tee -a "${{ github.workspace }}/kernel_workspace/packaging.log") 2>&1
           cd kernel_workspace
-          git clone https://github.com/cctv18/AnyKernel3 --depth=1
+          if ! git clone https://github.com/cctv18/AnyKernel3 --depth=1; then
+            echo "AnyKernel3 克隆失败，5秒后重试一次..."
+            rm -rf ./AnyKernel3
+            sleep 5
+            git clone https://github.com/cctv18/AnyKernel3 --depth=1
+          fi
           rm -rf ./AnyKernel3/.git
           cd AnyKernel3
-          cp ../common/out/arch/arm64/boot/Image ./Image
-          if [[ ! -f ./Image ]]; then
-            echo "未找到内核镜像文件，构建可能出错"
+          KERNEL_IMG="../common/out/arch/arm64/boot/Image"
+          if [[ ! -f "$KERNEL_IMG" ]]; then
+            # 兜底：镜像可能在其他位置（例如不同内核树的输出布局）
+            ALT="$(find ../common/out -maxdepth 6 -type f -name 'Image*' 2>/dev/null | head -n 1)"
+            if [[ -n "$ALT" ]]; then
+              echo "默认路径缺少 Image，改用兜底路径：$ALT"
+              KERNEL_IMG="$ALT"
+            fi
+          fi
+          if [[ ! -f "$KERNEL_IMG" ]]; then
+            echo "未找到内核镜像文件：$KERNEL_IMG"
+            echo "--- boot 目录内容 ---"
+            ls -l ../common/out/arch/arm64/boot/ 2>/dev/null || echo "(boot 目录不存在)"
+            echo "--- out 目录下所有 Image* ---"
+            find ../common/out -maxdepth 6 -name 'Image*' 2>/dev/null | head -n 20 || true
             exit 1
           fi
+          cp "$KERNEL_IMG" ./Image
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
             KSU_TYPENAME="SukiSU"
           elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
@@ -824,6 +813,49 @@ jobs:
         with:
           path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
           archive: false
+
+      - name: 收集编译错误摘要
+        if: failure()
+        run: |
+          WSD="${{ github.workspace }}/kernel_workspace"
+          {
+            echo "## ❌ 构建失败摘要"
+            echo ""
+            echo "- ksu_type: \`${{ github.event.inputs.ksu_type }}\` / susfs: \`${{ github.event.inputs.susfs_enable }}\` / kpm: \`${{ github.event.inputs.kpm_enable }}\`"
+            echo "- 提交: \`${{ github.sha }}\`"
+            echo ""
+            for f in build-configure.log build-compile.log packaging.log; do
+              if [ ! -f "$WSD/$f" ]; then
+                echo "### \`$f\`（未生成）"
+                echo ""
+                continue
+              fi
+              echo "### \`$f\`  —— 最后 40 行"
+              echo '```text'
+              tail -n 40 "$WSD/$f"
+              echo '```'
+              echo ""
+              echo "### \`$f\`  —— 匹配到的错误行"
+              echo '```text'
+              grep -nE 'error:|fatal error|undefined reference|No rule to make|Error [0-9]+|make(\[[0-9]+\])?: \*\*\*|cannot stat|No such file|No space left|Kconfig' "$WSD/$f" | tail -n 40 || echo "(无匹配)"
+              echo '```'
+              echo ""
+            done
+            echo "### 内核镜像检查"
+            echo '```text'
+            ls -l "$WSD/common/out/arch/arm64/boot/" 2>&1 | head -n 20 || true
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 上传构建日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs
+          path: |
+            ${{ github.workspace }}/kernel_workspace/build-*.log
+            ${{ github.workspace }}/kernel_workspace/packaging.log
+          if-no-files-found: warn
 
   release:
     needs: build
